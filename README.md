@@ -1,5 +1,5 @@
 
-## Codes for the paper "Super-resolved Virtual Staining of Label-free Tissue Using Diffusion Models" [[paper]](https://arxiv.org/pdf/2410.20073)
+## Codes for "Super-resolved Virtual Staining of Label-free Tissue Using Diffusion Models" [[paper]](https://arxiv.org/pdf/2410.20073)
 
 ## Installation
 
