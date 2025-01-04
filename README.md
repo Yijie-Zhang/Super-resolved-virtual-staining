@@ -9,6 +9,13 @@ Set up the environment using the `conda` environment file:
 conda env create -f environment.yml
 ```
 
+## Download Test Samples and Model
+
+Download the test samples and pretrained model from the following [Google Drive link](https://drive.google.com/drive/folders/1R9V5UtmlYHpGqQ_gjv02DH5QInz2kJ8k?usp=drive_link).
+.
+
+After downloading, place the test_data and model folders under the same directory as the project.
+
 ## Inference on Test Samples
 
 To run inference using different sampling strategies, execute the following commands:
