@@ -143,7 +143,57 @@ def _list_image_files_recursively(data_dir):
             results.extend(_list_image_files_recursively(full_path))
     return results
 
+def load_paired_npy_data(
+    *, input_dir, target_dir, batch_size, image_size, class_cond=False, deterministic=False
+):
+    """
+    For a dataset, create a generator over (images, kwargs) pairs.
 
+    Each images is an NCHW float tensor, and the kwargs dict contains zero or
+    more keys, each of which map to a batched Tensor of their own.
+    The kwargs dict can be used for class labels, in which case the key is "y"
+    and the values are integer tensors of class labels.
+
+    :param data_dir: a dataset directory.
+    :param batch_size: the batch size of each returned pair.
+    :param image_size: the size to which images are resized.
+    :param class_cond: if True, include a "y" key in returned dicts for class
+                       label. If classes are not available and this is true, an
+                       exception will be raised.
+    :param deterministic: if True, yield results in a deterministic order.
+    """
+    if not input_dir:
+        raise ValueError("unspecified data directory")
+    all_inputs = glob.glob(os.path.join(input_dir, '*.npy'))
+    if not target_dir:
+        raise ValueError("unspecified data directory")
+    all_targets = glob.glob(os.path.join(target_dir, '*.npy'))
+
+    classes = None
+    if class_cond:
+        # Assume classes are the first part of the filename,
+        # before an underscore.
+        class_names = [bf.basename(path).split("_")[0] for path in all_targets]
+        sorted_classes = {x: i for i, x in enumerate(sorted(set(class_names)))}
+        classes = [sorted_classes[x] for x in class_names]
+    dataset = PairedNPYDataset(
+        image_size,
+        all_inputs,
+        all_targets,
+        classes=classes,
+        shard=MPI.COMM_WORLD.Get_rank(),
+        num_shards=MPI.COMM_WORLD.Get_size(),
+    )
+    if deterministic:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=False, num_workers=4, drop_last=True
+        )
+    else:
+        loader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True
+        )
+    while True:
+        yield from loader
 
 class PairedMATDataset_test(Dataset):
     def __init__(self, resolution, input_images, target_images, classes=None, shard=0, num_shards=1):
@@ -195,83 +245,82 @@ class PairedMATDataset_test(Dataset):
             
         return tag_copy.transpose([2,0,1]), inp_copy.transpose([2,0,1]), out_dict, os.path.basename(path), os.path.basename(os.path.dirname(path))
 
-    
-def wavelet_transform(img_tensors: torch.Tensor, layers):
-    xfm = DWTForward(J=1, mode='periodization', wave='db1')
-    for i in range(layers):
-        Yls = []
-        for channel in range(img_tensors.shape[1]):
-            channel_tensor = img_tensors[:, channel, :, :].unsqueeze(1)
-            Yl, Yh = xfm(channel_tensor)
-            Yls.append(Yl)
-        img_tensors = torch.cat(Yls, dim=1)
 
-    return img_tensors
+class PairedNPYDataset(Dataset):
+    def __init__(self, resolution, input_images, target_images, classes=None, shard=0, num_shards=1):
+        super().__init__()
+        self.resolution = resolution
+        self.input_images = input_images[shard:][::num_shards]
+        self.target_images = target_images[shard:][::num_shards]
+        self.input_fnames = [os.path.basename(fp) for fp in self.input_images]
+        self.target_fnames = [os.path.basename(fp) for fp in self.target_images]
+        self.common_fnames = [f for f in self.input_fnames if f in self.target_fnames]
+        self.local_classes = None if classes is None else classes[shard:][::num_shards]
 
-def pixel_binning_4x(input_array):
-    """
-    Perform 4x4 pixel binning on an input array of shape (x, y, 4).
-    
-    Args:
-        input_array (numpy.ndarray): Input array of shape (x, y, 4).
+    def __len__(self):
+        return len(self.common_fnames)
+
+    def __getitem__(self, idx):
+        path = self.input_images[self.input_fnames.index(self.common_fnames[idx])]
+        with bf.BlobFile(path, "rb") as f:
+            inp = np.load(f).astype('float32')
+        path = self.target_images[self.target_fnames.index(self.common_fnames[idx])]
+        with bf.BlobFile(path, "rb") as f:
+            tag = np.load(f).astype('float32')
+            tag = tag / 255.0
+        if inp.ndim < 3:
+            inp = np.expand_dims(inp, axis=0)
+        if tag.ndim < 3:
+            tag = np.expand_dims(tag, axis=0)
         
-    Returns:
-        numpy.ndarray: Binned array of shape (x/4, y/4, 4).
-    """
-    
-    # Ensure the input dimensions are divisible by 4
-    if input_array.shape[0] % 4 != 0 or input_array.shape[1] % 4 != 0:
-        raise ValueError("Input dimensions must be divisible by 4.")
-    
-    # Reshape and take the mean across the 4x4 blocks
-    binned_array = input_array.reshape(input_array.shape[0]//4, 4, input_array.shape[1]//4, 4, 4).mean(axis=(1,3))
-    
-    return binned_array
+        tag_copy = np.ones_like(tag)
+        n = 0
+        while np.mean(tag_copy) * 255 >= 230:
+            crop_y = np.random.randint(0, inp.shape[0]-self.resolution)
+            crop_x = np.random.randint(0, inp.shape[1]-self.resolution)
 
-def pixel_binning_3x(input_array):
+            tag_copy = tag[crop_y : crop_y + self.resolution, crop_x : crop_x + self.resolution, ...].copy()
+            n = n+1
+            if n >5:
+                break
+            
+        inp = inp[crop_y : crop_y + self.resolution, crop_x : crop_x + self.resolution, ...]
+
+        mode = random.randint(0, 7)
+        inp, tag_copy = augment_img(inp, mode=mode), augment_img(tag_copy, mode=mode)
+
+        inp = pixel_binning(inp, 3)
+        
+        inp = (inp - inp.mean()) / (inp.std() + 1e-6)
+        tag_copy = tag_copy.astype(np.float32) * 255 / 127.5 - 1
+
+        out_dict = {}
+        if self.local_classes is not None:
+            out_dict["y"] = np.array(self.local_classes[idx], dtype=np.int64)
+        return tag_copy.transpose([2,0,1]), inp.transpose([2,0,1]), out_dict
+
+
+
+def pixel_binning(input_array, binning_factor=4):
     """
-    Perform 3x3 pixel binning on an input array of shape (256, 256, 4).
+    Perform pixel binning on an input array of shape (256, 256, 4).
     
     Args:
         input_array (numpy.ndarray): Input array of shape (256, 256, 4).
         
     Returns:
-        numpy.ndarray: Binned array of shape ((256-1)/3, (256-1)/3, 4), since 256 is not divisible by 3.
+        numpy.ndarray: Binned array of shape (256/4, 256/4, 4).
     """
     # Ensure the input dimensions are compatible
     # if input_array.shape[0] != 256 or input_array.shape[1] != 256:
     #     raise ValueError("Input dimensions must be 256x256.")
     
-    # # Crop the array to make it divisible by 3
-    # crop_size = 3 * (input_array.shape[0] // 3)  # Find the largest dimension divisible by 3
+    # # Crop the array to make it divisible by 4
+    # crop_size = 4 * (input_array.shape[0] // 4)  # Find the largest dimension divisible by 4
     # cropped_array = input_array[:crop_size, :crop_size, :]
     cropped_array = input_array
     
-    # Reshape and take the mean across the 3x3 blocks
-    binned_array = cropped_array.reshape(cropped_array.shape[0]//3, 3, cropped_array.shape[1]//3, 3, 4).mean(axis=(1,3))
-    
-    return binned_array
-
-def pixel_binning_5x(input_array):
-    """
-    Perform 5x5 pixel binning on an input array of shape (160, 160, 4).
-    
-    Args:
-        input_array (numpy.ndarray): Input array of shape (160, 160, 4).
-        
-    Returns:
-        numpy.ndarray: Binned array of shape ((160)/5, (160)/5, 4).
-    """
-    # Ensure the input dimensions are compatible
-    # if input_array.shape[0] != 256 or input_array.shape[1] != 256:
-    #     raise ValueError("Input dimensions must be 256x256.")
-    
-    # # Crop the array to make it divisible by 3
-    # crop_size = 3 * (input_array.shape[0] // 3)  # Find the largest dimension divisible by 3
-    # cropped_array = input_array[:crop_size, :crop_size, :]
-    cropped_array = input_array
-    
-    # Reshape and take the mean across the 3x3 blocks
-    binned_array = cropped_array.reshape(cropped_array.shape[0]//5, 5, cropped_array.shape[1]//5, 5, 4).mean(axis=(1,3))
+    # Reshape and take the mean across the 4x4 blocks
+    binned_array = cropped_array.reshape(cropped_array.shape[0]//binning_factor, binning_factor, cropped_array.shape[1]//binning_factor, binning_factor, 4).mean(axis=(1,3))
     
     return binned_array
