@@ -9,7 +9,7 @@ Set up the environment using the `conda` environment file:
 conda env create -f environment.yml
 ```
 
-## Training the model
+## Train the model
 
 ```bash
 python train.py
